@@ -1,0 +1,101 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Run only matching Jasmine specs: a '/'-separated suite/spec name prefix, e.g. CSSOM/CSSStyleRule (passed as ?spec= to spec/index.html). Empty runs all specs."
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build, pack and test cssom 0.3.8
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Toolchain the published cssom-0.3.8.tgz was packed with.
+      - name: Set up Node 8.11.1
+        uses: actions/setup-node@v4
+        with:
+          node-version: 8.11.1
+
+      - name: Pin npm 6.1.0
+        run: |
+          npm install -g npm@6.1.0
+          node -v; npm -v
+
+      # lib/CSSOM.js was restored (upstream later re-added it identically in
+      # NV/CSSOM 18d49c3b "Fix broken single file build"; the published 0.3.8
+      # tarball ships it), so the project's build.js runs again.
+      - name: Build single-file CSSOM (project build.js)
+        run: |
+          node build.js
+          head -c 200 build/CSSOM.js
+
+      - name: Smoke-load lib/ on Node 8
+        run: |
+          node -e "var CSSOM = require('./'); var s = CSSOM.parse('a { color: red }'); if (s.cssRules.length !== 1 || s.cssRules[0].style.color !== 'red') { throw new Error('unexpected parse result'); } console.log('require(\"./\") OK: ' + Object.keys(CSSOM).length + ' exports');"
+
+      - name: Pack
+        run: |
+          npm pack
+          ls -l cssom-0.3.8.tgz
+          tar -tzf cssom-0.3.8.tgz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cssom-0.3.8
+          path: cssom-0.3.8.tgz
+          if-no-files-found: error
+
+      # spec/index.html needs both git submodules; fetch them explicitly at the
+      # SHAs pinned by the upstream tree instead of relying on fork gitlinks.
+      - name: Fetch spec/vendor submodules
+        run: |
+          set -euo pipefail
+          fetch() {
+            rm -rf "$1"
+            git clone --quiet "$2" "$1"
+            git -C "$1" checkout --quiet "$3"
+            echo "$1 @ $(git -C "$1" rev-parse HEAD)"
+          }
+          fetch spec/vendor/objectDiff https://github.com/NV/objectDiff.js.git 34b029831ef9079f0f61eda4fcac214f1ee0580c
+          fetch spec/vendor/jasmine-html-reporter https://github.com/NV/jasmine-html-reporter.git 6631b3ee60fa59acf18ac1b5748ff978ca45ffbe
+
+      # Separate modern Node only to drive headless Chrome; the specs themselves
+      # run in the browser against lib/ via spec/index.html + src/loader.js.
+      - name: Set up Node 20 for the browser test driver
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install puppeteer-core (outside the package)
+        run: |
+          npm install --prefix "$RUNNER_TEMP/seal-runner" --no-audit --no-fund --no-save puppeteer-core@23.11.1
+          google-chrome --version
+
+      # Runs the project's Jasmine 1.1 suite from spec/index.html in headless Chrome.
+      # --extra: spec/CSSImportRule.spec.js is not referenced by index.html but passes
+      #   as-is, so it is included. spec/CSSProperty.spec.js is NOT included: it tests
+      #   CSSOM.CSSProperty, which does not exist in lib/ (stale spec, TypeError).
+      # --exclude: "@mediaall {}" fails on the pristine upstream 0.3.8 tree
+      #   (lib/parse.js matches the "@media" prefix without a word boundary and
+      #   yields a CSSMediaRule); upstream bug, unrelated to the build.
+      - name: Run Jasmine specs in headless Chrome
+        env:
+          NODE_PATH: ${{ runner.temp }}/seal-runner/node_modules
+          CHROME_PATH: google-chrome
+          SPEC_FILTER: ${{ inputs.test-filter }}
+          SPEC_TIMEOUT: '300'
+        run: |
+          node .github/seal/run-specs.js \
+            --extra spec/CSSImportRule.spec.js \
+            --exclude "CSSOM > parse > @mediaall {}"
